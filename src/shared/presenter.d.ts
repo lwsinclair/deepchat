@@ -1099,6 +1099,11 @@ export interface LLMAgentEventData {
   tool_call_server_name?: string
   tool_call_server_icons?: string
   tool_call_server_description?: string
+  
+  // Permission request related fields
+  tool_call_permission_required?: boolean
+  permission_type?: 'read' | 'write' | 'all'
+  permission_request_id?: string
 
   tool_call_response_raw?: any
   tool_call?: 'start' | 'running' | 'end' | 'error' | 'update'
@@ -1116,6 +1121,22 @@ export type LLMAgentEvent =
   | { type: 'response'; data: LLMAgentEventData }
   | { type: 'error'; data: { eventId: string; error: string } }
   | { type: 'end'; data: { eventId: string; userStop: boolean } }
+
+export interface PermissionRequest {
+  id: string
+  toolName: string
+  serverName: string
+  permissionType: 'read' | 'write' | 'all'
+  toolCall: MCPToolCall
+  timestamp: number
+}
+
+export interface PermissionResponse {
+  requestId: string
+  granted: boolean
+  rememberChoice: boolean
+  permissionType: 'read' | 'write' | 'all'
+}
 
 export { ShortcutKey, ShortcutKeySetting } from '@/presenter/configPresenter/shortcutKeySettings'
 

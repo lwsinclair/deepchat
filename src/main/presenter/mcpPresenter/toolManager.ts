@@ -1,5 +1,5 @@
 import { eventBus, SendTarget } from '@/eventbus'
-import { MCP_EVENTS, NOTIFICATION_EVENTS } from '@/events'
+import { MCP_EVENTS, NOTIFICATION_EVENTS, STREAM_EVENTS } from '@/events'
 import {
   MCPToolCall,
   MCPToolDefinition,
@@ -7,12 +7,15 @@ import {
   MCPContentItem,
   MCPTextContent,
   IConfigPresenter,
-  Resource
+  Resource,
+  PermissionRequest,
+  PermissionResponse
 } from '@shared/presenter'
 import { ServerManager } from './serverManager'
 import { McpClient } from './mcpClient'
 import { jsonrepair } from 'jsonrepair'
 import { getErrorMessageLabels } from '@shared/i18n'
+import { randomUUID } from 'crypto'
 
 export class ToolManager {
   private configPresenter: IConfigPresenter
@@ -20,11 +23,18 @@ export class ToolManager {
   private cachedToolDefinitions: MCPToolDefinition[] | null = null
   private toolNameToTargetMap: Map<string, { client: McpClient; originalName: string }> | null =
     null
+  private pendingPermissionRequests: Map<string, PermissionRequest> = new Map()
+  private permissionResponseCallbacks: Map<string, (response: PermissionResponse) => void> = new Map()
 
   constructor(configPresenter: IConfigPresenter, serverManager: ServerManager) {
     this.configPresenter = configPresenter
     this.serverManager = serverManager
     eventBus.on(MCP_EVENTS.CLIENT_LIST_UPDATED, this.handleServerListUpdate)
+    
+    // Listen for permission responses from renderer
+    eventBus.on(STREAM_EVENTS.PERMISSION_RESPONSE, (response: PermissionResponse) => {
+      this.handlePermissionResponse(response)
+    })
   }
 
   private handleServerListUpdate = (): void => {
@@ -196,6 +206,127 @@ export class ToolManager {
     return this.cachedToolDefinitions
   }
 
+  private handlePermissionResponse(response: PermissionResponse): void {
+    console.log('Received permission response:', response)
+    
+    const callback = this.permissionResponseCallbacks.get(response.requestId)
+    if (callback) {
+      callback(response)
+      this.permissionResponseCallbacks.delete(response.requestId)
+    }
+    
+    // If user chose to remember the choice, update the server configuration
+    if (response.granted && response.rememberChoice) {
+      const request = this.pendingPermissionRequests.get(response.requestId)
+      if (request) {
+        this.updateServerPermissions(request.serverName, response.permissionType)
+      }
+    }
+    
+    // Clean up pending request
+    this.pendingPermissionRequests.delete(response.requestId)
+  }
+
+  private async updateServerPermissions(serverName: string, permissionType: 'read' | 'write' | 'all'): Promise<void> {
+    try {
+      const servers = await this.configPresenter.getMcpServers()
+      const serverConfig = servers[serverName]
+      
+      if (serverConfig) {
+        const autoApprove = serverConfig.autoApprove || []
+        
+        // Add the permission if not already present
+        if (!autoApprove.includes(permissionType)) {
+          autoApprove.push(permissionType)
+          
+          // Update server configuration
+          await this.configPresenter.updateMcpServer(serverName, {
+            ...serverConfig,
+            autoApprove
+          })
+          
+          console.log(`Updated server ${serverName} permissions to include ${permissionType}`)
+        }
+      }
+    } catch (error) {
+      console.error('Failed to update server permissions:', error)
+    }
+  }
+
+  private determinePermissionType(toolName: string): 'read' | 'write' | 'all' {
+    const lowerToolName = toolName.toLowerCase()
+    
+    if (
+      lowerToolName.includes('read') ||
+      lowerToolName.includes('list') ||
+      lowerToolName.includes('get') ||
+      lowerToolName.includes('show') ||
+      lowerToolName.includes('view') ||
+      lowerToolName.includes('fetch')
+    ) {
+      return 'read'
+    }
+    
+    if (
+      lowerToolName.includes('write') ||
+      lowerToolName.includes('create') ||
+      lowerToolName.includes('update') ||
+      lowerToolName.includes('delete') ||
+      lowerToolName.includes('modify') ||
+      lowerToolName.includes('edit') ||
+      lowerToolName.includes('remove') ||
+      lowerToolName.includes('add') ||
+      lowerToolName.includes('insert') ||
+      lowerToolName.includes('save') ||
+      lowerToolName.includes('execute') ||
+      lowerToolName.includes('run') ||
+      lowerToolName.includes('call')
+    ) {
+      return 'write'
+    }
+    
+    // Default to write for unknown operations for safety
+    return 'write'
+  }
+
+  private async requestPermission(
+    toolName: string,
+    serverName: string,
+    permissionType: 'read' | 'write' | 'all',
+    toolCall: MCPToolCall
+  ): Promise<boolean> {
+    const requestId = randomUUID()
+    const request: PermissionRequest = {
+      id: requestId,
+      toolName,
+      serverName,
+      permissionType,
+      toolCall,
+      timestamp: Date.now()
+    }
+    
+    this.pendingPermissionRequests.set(requestId, request)
+    
+    // Send permission request to renderer
+    eventBus.sendToRenderer(STREAM_EVENTS.PERMISSION_REQUEST, SendTarget.ALL_WINDOWS, request)
+    
+    // Wait for response
+    return new Promise((resolve) => {
+      this.permissionResponseCallbacks.set(requestId, (response: PermissionResponse) => {
+        resolve(response.granted)
+      })
+      
+      // Set a timeout to avoid hanging indefinitely
+      setTimeout(() => {
+        if (this.permissionResponseCallbacks.has(requestId)) {
+          this.permissionResponseCallbacks.delete(requestId)
+          this.pendingPermissionRequests.delete(requestId)
+          resolve(false) // Deny by default on timeout
+        }
+      }, 30000) // 30 seconds timeout
+    })
+  }
+
   // 检查工具调用权限
   private checkToolPermission(
     originalToolName: string,
@@ -207,22 +338,25 @@ export class ToolManager {
     if (autoApprove.includes('all')) {
       return true
     }
-    if (
-      originalToolName.includes('read') ||
-      originalToolName.includes('list') ||
-      originalToolName.includes('get')
-    ) {
-      return autoApprove.includes('read')
+    
+    const permissionType = this.determinePermissionType(originalToolName)
+    
+    // Check if the specific permission type is approved
+    if (autoApprove.includes(permissionType)) {
+      return true
     }
-    if (
-      originalToolName.includes('write') ||
-      originalToolName.includes('create') ||
-      originalToolName.includes('update') ||
-      originalToolName.includes('delete')
-    ) {
-      return autoApprove.includes('write')
+    
+    // If it's a read operation, check if read is approved
+    if (permissionType === 'read' && autoApprove.includes('read')) {
+      return true
     }
-    return true
+    
+    // If it's a write operation, check if write is approved
+    if (permissionType === 'write' && autoApprove.includes('write')) {
+      return true
+    }
+    
+    return false
   }
 
   async callTool(toolCall: MCPToolCall): Promise<MCPToolResponse> {
@@ -304,10 +438,19 @@ export class ToolManager {
 
       if (!hasPermission) {
         console.warn(`Permission denied for tool '${originalName}' on server '${toolServerName}'.`)
-        return {
-          toolCallId: toolCall.id,
-          content: `Error: Operation not permitted. The '${originalName}' operation on server '${toolServerName}' requires appropriate permissions.`,
-          isError: true // Indicate error
+        
+        // Determine the permission type required
+        const permissionType = this.determinePermissionType(originalName)
+        
+        // Request permission from user
+        const granted = await this.requestPermission(originalName, toolServerName, permissionType, toolCall)
+        
+        if (!granted) {
+          return {
+            toolCallId: toolCall.id,
+            content: `Error: Operation not permitted. The '${originalName}' operation on server '${toolServerName}' requires ${permissionType} permissions.`,
+            isError: true // Indicate error
+          }
         }
       }
 
